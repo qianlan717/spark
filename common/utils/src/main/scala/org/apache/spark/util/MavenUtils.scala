@@ -21,11 +21,12 @@ import java.io.{File, IOException, PrintStream}
 import java.net.URI
 import java.text.ParseException
 import java.util.UUID
-import java.util.concurrent.{Callable, CancellationException, ExecutionException, FutureTask, TimeoutException, TimeUnit}
+import java.util.concurrent.{Callable, CancellationException, ExecutionException, ExecutorService, Executors, TimeoutException, TimeUnit}
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.locks.ReentrantLock
 
 import scala.jdk.CollectionConverters._
+import scala.util.control.NonFatal
 
 import org.apache.ivy.Ivy
 import org.apache.ivy.core.LogOptions
@@ -68,10 +69,15 @@ private[spark] object MavenUtils extends Logging {
 
     def isCancelled: Boolean = requested.get()
 
-    def cancel(resolutionThread: Thread): Unit = {
-      requested.set(true)
-      resolutionThread.interrupt()
-    }
+    def cancel(): Unit = requested.set(true)
+  }
+
+  private def newIvyResolutionExecutor(): ExecutorService = {
+    Executors.newSingleThreadExecutor((runnable: Runnable) => {
+      val thread = new Thread(runnable, "spark-ivy-resolution")
+      thread.setDaemon(true)
+      thread
+    })
   }
 
   private def checkCancelled(isCancelled: () => Boolean): Unit = {
@@ -104,20 +110,21 @@ private[spark] object MavenUtils extends Logging {
       body: IvyResolutionCancellation => T): T = {
     checkCancelled(isCancelled)
     val cancellation = new IvyResolutionCancellation
-    val task = new FutureTask[T](new Callable[T] {
+    val executor = newIvyResolutionExecutor()
+    val task = executor.submit(new Callable[T] {
       override def call(): T = body(cancellation)
     })
-    val resolutionThread = new Thread(task, "spark-ivy-resolution")
-    resolutionThread.setDaemon(true)
-    resolutionThread.start()
+    executor.shutdown()
 
     def cancelAndWait(): Unit = {
       var wasInterrupted = Thread.interrupted()
       try {
-        cancellation.cancel(resolutionThread)
-        while (resolutionThread.isAlive) {
+        cancellation.cancel()
+        task.cancel(true)
+        var terminated = false
+        while (!terminated) {
           try {
-            resolutionThread.join()
+            terminated = executor.awaitTermination(Long.MaxValue, TimeUnit.NANOSECONDS)
           } catch {
             case _: InterruptedException => wasInterrupted = true
           }
@@ -153,7 +160,7 @@ private[spark] object MavenUtils extends Logging {
         throw e
       case e: ExecutionException =>
         throw e.getCause
-      case e: Throwable =>
+      case NonFatal(e) =>
         cancelAndWait()
         throw e
     }
